@@ -8,24 +8,22 @@ from langchain.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from google.cloud import storage
 import vertexai
-from vertexai.generative_models import GenerativeModel # Importación necesaria para la prueba directa
+from vertexai.generative_models import GenerativeModel
 from langchain.chains import RetrievalQA # Aseguramos que está importado para query_rag
+from google.auth import default 
 
 app = Flask(__name__)
 
 # --- Configuración ---
-# Asegúrate de que estas variables de entorno están configuradas en Cloud Run
-# Puedes usar --set-env-vars en gcloud run deploy
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = os.environ.get("GCP_REGION", "us-central1")
 FAISS_INDEX_BUCKET_NAME = os.environ.get("FAISS_BUCKET_NAME", "mi-coto-rag-faiss-index")
 FAISS_INDEX_BLOB_PREFIX = os.environ.get("FAISS_BLOB_PREFIX", "my_faiss_index")
 EMBEDDINGS_MODEL = "all-MiniLM-L6-v2"
-GEMINI_MODEL = "gemini-2.0-flash-lite" # O el modelo específico que necesites de Gemini
+GEMINI_MODEL = "gemini-2.0-flash-lite"
 LOCAL_FAISS_DIR = "/tmp/faiss_index"
 
 # --- Logging ---
-# Configura el logging para que se muestre en Stackdriver Logging de Google Cloud
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -33,12 +31,9 @@ logger = logging.getLogger(__name__)
 llm = None
 vector_store = None
 QA_CHAIN_PROMPT = None
-init_error = None  # Almacena el traceback si la inicialización falla
+init_error = None
 
 def download_faiss_index_from_gcs(bucket_name: str, blob_prefix: str, local_dir: str):
-    """
-    Descarga el índice FAISS de un bucket de GCS a un directorio local.
-    """
     logger.info(f"Iniciando descarga del índice FAISS de GCS: bucket={bucket_name}, prefix={blob_prefix}")
     os.makedirs(local_dir, exist_ok=True)
     storage_client = storage.Client()
@@ -51,30 +46,22 @@ def download_faiss_index_from_gcs(bucket_name: str, blob_prefix: str, local_dir:
         raise FileNotFoundError(f"No FAISS index found at gs://{bucket_name}/{blob_prefix}/")
 
     for blob in blobs:
-        if not blob.name.endswith('/'): # Ignorar directorios virtuales
+        if not blob.name.endswith('/'):
             local_file_path = os.path.join(local_dir, os.path.relpath(blob.name, blob_prefix))
             os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
             logger.info(f"Descargando {blob.name} a {local_file_path}")
             blob.download_to_filename(local_file_path)
     logger.info("Índice FAISS descargado exitosamente.")
 
-# Se elimina el decorador @app.before_first_request de aquí
 def initialize_rag_components():
-    """
-    Inicializa los componentes de RAG (Vertex AI, FAISS Vector Store, LLM y Prompt).
-    Esta función ahora debe ser llamada explícitamente al inicio de la aplicación o
-    como respaldo en los endpoints si los componentes no están listos.
-    """
     global vector_store, llm, QA_CHAIN_PROMPT, init_error
 
-    # Si ya se inicializó o ya falló antes, no intentes de nuevo
     if all([vector_store, llm, QA_CHAIN_PROMPT]) or init_error:
         logger.info("Los componentes RAG ya fueron inicializados o hubo un error previo.")
         return
 
     try:
         logger.info("Paso 1: Inicializando Vertex AI...")
-        # Asegúrate de que PROJECT_ID y LOCATION están definidos
         if not PROJECT_ID:
             raise ValueError("La variable de entorno GOOGLE_CLOUD_PROJECT no está configurada.")
         if not LOCATION:
@@ -83,12 +70,10 @@ def initialize_rag_components():
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         logger.info(f"Vertex AI inicializado para proyecto '{PROJECT_ID}' en '{LOCATION}'.")
 
-        # --- PRUEBA DE DIAGNÓSTICO DIRECTA DE LA API DE GEMINI ---
-        # Esto ayudará a confirmar si el problema de permisos es con vertexai.init() o con langchain.
+        # --- PRUEBA DE DIAGNÓSTICO DIRECTA DE LA API DE GEMINI (mantenida por si acaso) ---
         try:
             logger.info(f"Paso 2: Realizando prueba directa de la API de Gemini con el modelo '{GEMINI_MODEL}'...")
             test_model = GenerativeModel(GEMINI_MODEL)
-            # Una solicitud simple para verificar la autenticación
             test_response = test_model.generate_content("Hello, world! Say hi back.")
             if test_response.text:
                 logger.info(f"Prueba directa de Gemini EXITOSA. Respuesta de prueba: '{test_response.text[:50]}...'")
@@ -96,8 +81,8 @@ def initialize_rag_components():
                 logger.warning("Prueba directa de Gemini exitosa, pero la respuesta de prueba está vacía.")
         except Exception as gemini_test_e:
             logger.error(f"FALLO la prueba directa de la API de Gemini: {gemini_test_e}")
-            logger.error(traceback.format_exc()) # Imprime el traceback para esta falla específica
-            raise # Re-lanza la excepción para que el bloque except principal la capture
+            logger.error(traceback.format_exc())
+            raise
         # --- FIN PRUEBA DE DIAGNÓSTICO ---
 
         logger.info("Paso 3: Creando directorio local para FAISS...")
@@ -109,18 +94,23 @@ def initialize_rag_components():
         logger.info("Paso 5: Cargando embeddings de HuggingFace...")
         embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDINGS_MODEL,
-            model_kwargs={"device": "cpu"} # Asegura que se ejecuta en CPU en Cloud Run
+            model_kwargs={"device": "cpu"}
         )
         
         logger.info("Paso 6: Cargando Vector Store FAISS...")
-        # Es crucial que allow_dangerous_deserialization sea True para cargar índices guardados
         vector_store = FAISS.load_local(LOCAL_FAISS_DIR, embeddings, allow_dangerous_deserialization=True)
         logger.info("Vector Store FAISS cargado.")
         
         logger.info("Paso 7: Inicializando modelo Gemini para Langchain...")
+        
+        # Obtener las credenciales predeterminadas que Cloud Run ya está utilizando
+        credentials, _ = default()
+        logger.info("Credenciales predeterminadas obtenidas para Langchain.")
+
         llm = ChatGoogleGenerativeAI(
             model=GEMINI_MODEL,
-            temperature=0.1 # Baja temperatura para respuestas más deterministas
+            temperature=0.1,
+            credentials=credentials # Mantenemos esto, fue parte del entorno donde la prueba directa funcionó
         )
         logger.info("Modelo Gemini (para Langchain) inicializado.")
         
@@ -146,16 +136,12 @@ def initialize_rag_components():
         logger.error("ERROR CRÍTICO durante la inicialización de componentes RAG. El servicio no estará listo.")
         tb = traceback.format_exc()
         logger.error(tb)
-        init_error = tb # Almacena el traceback para la ruta /health
+        init_error = tb
 
 @app.route("/health", methods=["GET"])
 def health():
-    """
-    Endpoint de salud para verificar si el servicio está listo.
-    """
     global vector_store, llm, QA_CHAIN_PROMPT, init_error
     
-    # Intenta inicializar si no está listo y no hubo un error previo
     if not all([vector_store, llm, QA_CHAIN_PROMPT]) and not init_error:
         logger.info("Health check: Intentando inicializar componentes RAG (cold start o reintento)...")
         initialize_rag_components() 
@@ -165,7 +151,6 @@ def health():
         return jsonify({"status": "ok", "message": "Servicio RAG listo."}), 200
     
     if init_error:
-        # Devuelve el error real para facilitar la depuración
         logger.error(f"Health check: Error de inicialización detectado. {init_error}")
         return f"<pre>Error de inicialización: {init_error}</pre>", 500
     
@@ -174,15 +159,11 @@ def health():
 
 @app.route("/query", methods=["POST"])
 def query_rag():
-    """
-    Endpoint principal para realizar consultas RAG.
-    """
     global vector_store, llm, QA_CHAIN_PROMPT, init_error
 
-    # Asegúrate de que los componentes estén inicializados antes de procesar la consulta
     if not all([vector_store, llm, QA_CHAIN_PROMPT]) and not init_error:
         logger.info("Query received but components not ready. Attempting initialization...")
-        initialize_rag_components() # Fuerza la inicialización si es un cold start
+        initialize_rag_components() 
     
     if llm is None or vector_store is None or QA_CHAIN_PROMPT is None:
         logger.error("Query rejected: Algún componente RAG está vacío después de la inicialización.")
@@ -194,12 +175,12 @@ def query_rag():
         return jsonify({"error": "No se proporcionó ninguna pregunta"}), 400
 
     try:
-        # Crea la cadena de QA utilizando los componentes inicializados
+        # --- BLOQUE ORIGINAL DE RAG: Activado de nuevo ---
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
             retriever=vector_store.as_retriever(),
             chain_type_kwargs={"prompt": QA_CHAIN_PROMPT},
-            return_source_documents=True # Para devolver las fuentes de información
+            return_source_documents=True
         )
         
         logger.info(f"Procesando pregunta: '{question}'")
@@ -217,14 +198,13 @@ def query_rag():
             "response": result["result"],
             "source_documents": source_documents_formatted
         }), 200
+        # --- FIN BLOQUE ORIGINAL DE RAG ---
 
     except Exception as e:
         logger.error(f"Error al procesar la pregunta: {e}")
-        logger.error(traceback.format_exc()) # Imprime el traceback completo en los logs
+        logger.error(traceback.format_exc())
         return jsonify({"error": f"Ocurrió un error al procesar la pregunta: {e}"}), 500
 
 if __name__ == "__main__":
-    # IMPORTANTE: En producción (Cloud Run), usa debug=False.
-    # Esta es la forma recomendada de iniciar la inicialización una vez por contenedor/proceso.
-    initialize_rag_components() # <--- ¡Aquí se llama la inicialización!
+    initialize_rag_components()
     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
