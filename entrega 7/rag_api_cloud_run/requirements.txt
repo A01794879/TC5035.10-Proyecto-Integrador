@@ -1,0 +1,11 @@
+Flask
+google-cloud-storage
+langchain
+langchain-huggingface 
+langchain-community
+langchain-google-genai
+langchain-google-vertexai
+vertexai
+faiss-cpu
+sentence-transformers
+google-cloud-aiplatform
